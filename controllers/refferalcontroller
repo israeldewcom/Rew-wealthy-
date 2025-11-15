@@ -1,0 +1,260 @@
+// controllers/referralController.js
+const User = require('../models/User');
+const Transaction = require('../models/Transaction');
+const Investment = require('../models/Investment');
+const logger = require('../utils/logger');
+
+// @desc    Get referral statistics
+// @route   GET /api/referrals/stats
+// @access  Private
+exports.getReferralStats = async (req, res, next) => {
+  try {
+    const userId = req.user.id;
+
+    // Get referral count
+    const referralCount = await User.countDocuments({ referred_by: userId });
+    
+    // Get active referrals (users who have invested)
+    const activeReferrals = await User.countDocuments({ 
+      referred_by: userId,
+      total_earnings: { $gt: 0 }
+    });
+
+    // Get total referral earnings
+    const referralEarnings = await Transaction.aggregate([
+      {
+        $match: { 
+          user: userId,
+          type: 'referral',
+          status: 'completed'
+        }
+      },
+      {
+        $group: {
+          _id: null,
+          total: { $sum: '$amount' }
+        }
+      }
+    ]);
+
+    // Get pending referral earnings
+    const pendingEarnings = await Transaction.aggregate([
+      {
+        $match: { 
+          user: userId,
+          type: 'referral',
+          status: 'pending'
+        }
+      },
+      {
+        $group: {
+          _id: null,
+          total: { $sum: '$amount' }
+        }
+      }
+    ]);
+
+    // Get referred users with their investment status
+    const referredUsers = await User.find({ referred_by: userId })
+      .select('full_name email created_at total_earnings kyc_verified')
+      .sort({ created_at: -1 })
+      .limit(10);
+
+    const stats = {
+      total_referrals: referralCount,
+      active_referrals: activeReferrals,
+      total_earnings: referralEarnings[0]?.total || 0,
+      pending_earnings: pendingEarnings[0]?.total || 0,
+      referred_users: referredUsers
+    };
+
+    res.status(200).json({
+      success: true,
+      data: { stats }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get referral link and code
+// @route   GET /api/referrals/link
+// @access  Private
+exports.getReferralLink = async (req, res, next) => {
+  try {
+    const user = await User.findById(req.user.id);
+    
+    if (!user.referral_code) {
+      return res.status(400).json({
+        success: false,
+        message: 'Referral code not found'
+      });
+    }
+
+    const referralLink = `${process.env.CLIENT_URL}/register?ref=${user.referral_code}`;
+
+    res.status(200).json({
+      success: true,
+      data: {
+        referral_link: referralLink,
+        referral_code: user.referral_code
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get referred users list
+// @route   GET /api/referrals/users
+// @access  Private
+exports.getReferredUsers = async (req, res, next) => {
+  try {
+    const { page = 1, limit = 20 } = req.query;
+
+    const referredUsers = await User.find({ referred_by: req.user.id })
+      .select('full_name email phone created_at total_earnings kyc_verified last_login')
+      .sort({ created_at: -1 })
+      .limit(limit * 1)
+      .skip((page - 1) * limit);
+
+    const total = await User.countDocuments({ referred_by: req.user.id });
+
+    res.status(200).json({
+      success: true,
+      data: {
+        referred_users: referredUsers,
+        totalPages: Math.ceil(total / limit),
+        currentPage: page,
+        total
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get referral earnings history
+// @route   GET /api/referrals/earnings
+// @access  Private
+exports.getReferralEarnings = async (req, res, next) => {
+  try {
+    const { page = 1, limit = 20 } = req.query;
+
+    const earnings = await Transaction.find({ 
+      user: req.user.id,
+      type: 'referral'
+    })
+      .populate('user', 'full_name email')
+      .sort({ created_at: -1 })
+      .limit(limit * 1)
+      .skip((page - 1) * limit);
+
+    const total = await Transaction.countDocuments({ 
+      user: req.user.id,
+      type: 'referral'
+    });
+
+    // Calculate total earnings by status
+    const earningsStats = await Transaction.aggregate([
+      {
+        $match: { 
+          user: req.user.id,
+          type: 'referral'
+        }
+      },
+      {
+        $group: {
+          _id: '$status',
+          total: { $sum: '$amount' }
+        }
+      }
+    ]);
+
+    res.status(200).json({
+      success: true,
+      data: {
+        earnings,
+        totalPages: Math.ceil(total / limit),
+        currentPage: page,
+        total,
+        stats: earningsStats
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Process referral bonus when referred user invests
+// @route   POST /api/referrals/process-bonus
+// @access  Private/System
+exports.processReferralBonus = async (req, res, next) => {
+  try {
+    const { investment_id } = req.body;
+
+    const investment = await Investment.findById(investment_id)
+      .populate('user')
+      .populate('plan');
+
+    if (!investment) {
+      return res.status(404).json({
+        success: false,
+        message: 'Investment not found'
+      });
+    }
+
+    const user = investment.user;
+
+    // Check if user was referred
+    if (!user.referred_by) {
+      return res.status(200).json({
+        success: true,
+        message: 'User was not referred, no bonus to process'
+      });
+    }
+
+    // Calculate referral bonus (20% of first investment)
+    const referralBonus = investment.amount * 0.20;
+
+    // Create referral transaction for referrer
+    const referralTransaction = await Transaction.create({
+      user: user.referred_by,
+      type: 'referral',
+      amount: referralBonus,
+      description: `Referral bonus from ${user.full_name}'s investment in ${investment.plan.name}`,
+      status: 'completed',
+      metadata: {
+        referred_user: user._id,
+        investment_id: investment._id,
+        investment_amount: investment.amount
+      }
+    });
+
+    // Update referrer's balance and referral earnings
+    await User.findByIdAndUpdate(user.referred_by, {
+      $inc: { 
+        balance: referralBonus,
+        referral_earnings: referralBonus
+      }
+    });
+
+    // Notify referrer via Socket.IO
+    const io = req.app.get('io');
+    io.to(`user-${user.referred_by}`).emit('referral-bonus', {
+      message: `You earned ₦${referralBonus.toLocaleString()} referral bonus!`,
+      amount: referralBonus,
+      referred_user: user.full_name
+    });
+
+    logger.info(`Referral bonus processed: ${referralBonus} for user ${user.referred_by}`);
+
+    res.status(200).json({
+      success: true,
+      message: 'Referral bonus processed successfully',
+      data: { transaction: referralTransaction }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
