@@ -1163,8 +1163,9 @@ const adminAuth = async (req, res, next) => {
 const initializeDatabase = async () => {
   console.log('🔄 Initializing database with enhanced connection...');
   
-  // Set Mongoose debug mode
-  mongoose.set('debug', config.debug);
+  // Disable Mongoose buffering
+  mongoose.set('bufferCommands', false);
+  mongoose.set('bufferTimeoutMS', 0);
   
   // Handle Mongoose connection events
   mongoose.connection.on('connecting', () => {
@@ -1188,54 +1189,95 @@ const initializeDatabase = async () => {
   });
   
   try {
-    // DEBUGGED CONNECTION - Remove deprecated options
-    console.log(`🔗 Attempting to connect to: ${config.mongoURI ? 'MongoDB URI provided' : 'No URI found'}`);
+    console.log(`🔗 Connecting to MongoDB...`);
     
+    // MASKED URI for logging
+    const maskedURI = config.mongoURI ? 
+      config.mongoURI.replace(/mongodb\+srv:\/\/([^:]+):[^@]+@/, 'mongodb+srv://$1:****@') :
+      'No URI';
+    console.log(`🔗 Masked URI: ${maskedURI}`);
+    
+    // CRITICAL: Connection options for Render + MongoDB Atlas
     const connectionOptions = {
-      serverSelectionTimeoutMS: 10000, // Increased timeout
-      socketTimeoutMS: 45000,
-      maxPoolSize: 10,
+      serverSelectionTimeoutMS: 30000,  // 30 seconds
+      socketTimeoutMS: 60000,           // 60 seconds
+      maxPoolSize: 5,                   // Small pool for free tier
+      minPoolSize: 1,
+      maxIdleTimeMS: 60000,
+      connectTimeoutMS: 30000,
       retryWrites: true,
-      // Remove deprecated options:
-      // useNewUrlParser: true, // ❌ REMOVED
-      // useUnifiedTopology: true // ❌ REMOVED
+      w: 'majority',
+      // These are REQUIRED for MongoDB Atlas
+      useNewUrlParser: true,
+      useUnifiedTopology: true,
+      // Disable buffering
+      bufferCommands: false,
+      bufferMaxEntries: 0
     };
     
-    await mongoose.connect(config.mongoURI, connectionOptions);
+    // Try connecting with retries
+    let connected = false;
+    let attempts = 3;
     
-    console.log('✅ MongoDB connection established');
-    
-    // Load investment plans
-    await loadInvestmentPlans();
-    
-    // Create admin user if it doesn't exist
-    await createAdminUser();
-    
-    // Create indexes
-    await createDatabaseIndexes();
-    
-    console.log('✅ Database initialization completed successfully');
-    
-  } catch (error) {
-    console.error('❌ FATAL: Database initialization failed:', error.message);
-    console.error('Stack trace:', error.stack);
-    
-    // Try fallback connection for development
-    if (config.nodeEnv === 'development') {
-      console.log('🔄 Attempting fallback to local MongoDB...');
+    while (!connected && attempts > 0) {
       try {
-        const fallbackURI = 'mongodb://localhost:27017/rawwealthy';
-        await mongoose.connect(fallbackURI);
-        console.log('✅ Connected to local MongoDB fallback');
-      } catch (fallbackError) {
-        console.error('❌ Fallback connection also failed:', fallbackError.message);
+        console.log(`🔄 Connection attempt ${4-attempts}/3...`);
+        await mongoose.connect(config.mongoURI, connectionOptions);
+        connected = true;
+        console.log('✅ MongoDB connection established');
+      } catch (error) {
+        attempts--;
+        console.error(`❌ Connection failed: ${error.message}`);
+        if (attempts > 0) {
+          console.log(`⏳ Retrying in 3 seconds...`);
+          await new Promise(resolve => setTimeout(resolve, 3000));
+        } else {
+          throw error;
+        }
       }
     }
     
-    // Don't throw error - let server start without DB for debugging
-    console.log('⚠️ Server starting without database connection');
+    if (connected) {
+      // Load investment plans
+      await loadInvestmentPlans();
+      
+      // Create admin user if it doesn't exist
+      await createAdminUser();
+      
+      console.log('✅ Database initialization completed successfully');
+      
+      // Start a keep-alive ping
+      setInterval(() => {
+        if (mongoose.connection.readyState === 1) {
+          mongoose.connection.db.command({ ping: 1 })
+            .then(() => console.log('🫀 MongoDB ping successful'))
+            .catch(err => console.error('❌ MongoDB ping failed:', err.message));
+        }
+      }, 30000); // Every 30 seconds
+    }
+    
+  } catch (error) {
+    console.error('❌ Database initialization failed:', error.message);
+    
+    // Provide helpful error message
+    if (error.message.includes('bad auth')) {
+      console.error('\n🔐 AUTHENTICATION ERROR:');
+      console.error('1. Check MongoDB username/password');
+      console.error('2. Check if user has database permissions');
+      console.error('3. Check IP whitelist in MongoDB Atlas');
+    } else if (error.message.includes('ENOTFOUND')) {
+      console.error('\n🌐 NETWORK ERROR:');
+      console.error('1. Check hostname in connection string');
+      console.error('2. Check MongoDB Atlas cluster status');
+    } else if (error.message.includes('timed out')) {
+      console.error('\n⏰ TIMEOUT ERROR:');
+      console.error('1. Increase timeout values');
+      console.error('2. Check network between Render and MongoDB');
+    }
+    
+    console.error('\n⚠️ Server starting in limited mode (no database)');
   }
-};
+};   
 
 const loadInvestmentPlans = async () => {
   try {
